@@ -29,12 +29,15 @@ import static com.android.systemui.util.leak.RotationUtils.ROTATION_UPSIDE_DOWN;
 
 import android.content.Context;
 import android.content.res.Configuration;
+import android.database.ExecutorContentObserver;
 import android.graphics.Insets;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.os.Binder;
 import android.os.RemoteException;
 import android.os.Trace;
+import android.os.UserHandle;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
 import android.view.DisplayCutout;
@@ -49,7 +52,6 @@ import android.view.WindowManager;
 
 import androidx.annotation.NonNull;
 
-import com.android.internal.policy.SystemBarUtils;
 import com.android.systemui.animation.ActivityTransitionAnimator;
 import com.android.systemui.animation.DelegateTransitionAnimatorController;
 import com.android.systemui.dagger.qualifiers.Main;
@@ -60,12 +62,16 @@ import com.android.systemui.log.core.LogLevel;
 import com.android.systemui.res.R;
 import com.android.systemui.statusbar.core.StatusBarConnectedDisplays;
 import com.android.systemui.statusbar.core.StatusBarRootModernization;
+import com.android.systemui.statusbar.core.StatusBarForDesktop;
 import com.android.systemui.statusbar.data.repository.StatusBarConfigurationController;
+import com.android.systemui.statusbar.layout.StatusBarContentInsetsChangedListener;
 import com.android.systemui.statusbar.layout.StatusBarContentInsetsProvider;
 import com.android.systemui.statusbar.policy.ConfigurationController;
 import com.android.systemui.statusbar.window.StatusBarWindowModule.InternalWindowViewInflater;
 import com.android.systemui.unfold.UnfoldTransitionProgressProvider;
 import com.android.systemui.unfold.util.JankMonitorTransitionProgressListener;
+
+import lineageos.providers.LineageSettings;
 
 import dagger.assisted.Assisted;
 import dagger.assisted.AssistedFactory;
@@ -92,6 +98,11 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
     private int mBarHeight = -1;
     private final State mCurrentState = new State();
     private boolean mIsAttached;
+    private boolean mStatusBarInCutoutEnabled;
+    private boolean mStatusBarInCutoutObserverRegistered;
+    private final ExecutorContentObserver mStatusBarInCutoutObserver;
+    private final StatusBarContentInsetsChangedListener mStatusBarLocationsCallback =
+            this::calculateStatusBarLocationsForAllRotations;
 
     private final StatusBarWindowView mStatusBarWindowView;
     private final FragmentService mFragmentService;
@@ -131,14 +142,22 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         mContentInsetsProvider = contentInsetsProvider;
         mMainExecutor = mainExecutor;
         mLogBuffer = logBuffer;
+        mStatusBarInCutoutEnabled = readStatusBarInCutoutSetting();
         mStatusBarWindowView = statusBarWindowViewInflater.inflate(context);
+        mStatusBarWindowView.setStatusBarInCutoutEnabled(isCutoutAlignmentActive());
+        mStatusBarInCutoutObserver = new ExecutorContentObserver(mMainExecutor) {
+            @Override
+            public void onChange(boolean selfChange) {
+                refreshStatusBarInCutoutMode();
+            }
+        };
         mFragmentService = fragmentService;
         mLaunchAnimationContainer = mStatusBarWindowView.findViewById(
                 R.id.status_bar_launch_animation_container);
         mLpChanged = new WindowManager.LayoutParams();
 
         if (mBarHeight < 0) {
-            mBarHeight = SystemBarUtils.getStatusBarHeight(mContext);
+            mBarHeight = getCurrentBarThickness();
         }
         unfoldTransitionProgressProvider.ifPresent(
                 unfoldProgressProvider -> unfoldProgressProvider.addCallback(
@@ -151,14 +170,73 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         return mBarHeight;
     }
 
+    private boolean readStatusBarInCutoutSetting() {
+        if (mDisplayId != Display.DEFAULT_DISPLAY) {
+            return false;
+        }
+        try {
+            return LineageSettings.System.getIntForUser(
+                    mContext.getContentResolver(),
+                    LineageSettings.System.STATUS_BAR_IN_CUTOUT,
+                    0,
+                    UserHandle.USER_CURRENT) != 0;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to read cutout-aligned status bar setting", e);
+            return false;
+        }
+    }
+
+    private boolean isCutoutAlignmentActive() {
+        return mStatusBarInCutoutEnabled && !StatusBarForDesktop.isEnabled();
+    }
+
+    private int getCurrentBarThickness() {
+        final int rotation = mContext.getDisplay().getRotation();
+        return getBarThicknessForRotation(
+                getBarGravityForRotation(rotation), getDisplayCutoutForRotation(rotation));
+    }
+
+    private void refreshStatusBarInCutoutMode() {
+        mStatusBarInCutoutEnabled = readStatusBarInCutoutSetting();
+        mBarHeight = getCurrentBarThickness();
+        mStatusBarWindowView.setStatusBarInCutoutEnabled(isCutoutAlignmentActive());
+        mContentInsetsProvider.refresh();
+        if (mIsAttached && mLp != null) {
+            // Re-read the cutout and rebuild every rotation. A settings notification can arrive
+            // together with a display-state change, and per-rotation parameters must not alias the
+            // currently installed LayoutParams.
+            refreshStatusBarHeight();
+        }
+    }
+
+    private void registerStatusBarInCutoutObserver() {
+        if (mDisplayId != Display.DEFAULT_DISPLAY
+                || mStatusBarInCutoutObserverRegistered) {
+            return;
+        }
+        mContext.getContentResolver().registerContentObserver(
+                LineageSettings.System.getUriFor(LineageSettings.System.STATUS_BAR_IN_CUTOUT),
+                false,
+                mStatusBarInCutoutObserver,
+                UserHandle.USER_CURRENT);
+        mStatusBarInCutoutObserverRegistered = true;
+    }
+
+    private void unregisterStatusBarInCutoutObserver() {
+        if (!mStatusBarInCutoutObserverRegistered) {
+            return;
+        }
+        mContext.getContentResolver().unregisterContentObserver(mStatusBarInCutoutObserver);
+        mStatusBarInCutoutObserverRegistered = false;
+    }
+
     @Override
     public void refreshStatusBarHeight() {
         Trace.beginSection("StatusBarWindowController#refreshStatusBarHeight");
         try {
-            int heightFromConfig = SystemBarUtils.getStatusBarHeight(mContext);
-
-            if (mBarHeight != heightFromConfig) {
-                mBarHeight = heightFromConfig;
+            mBarHeight = getCurrentBarThickness();
+            if (mIsAttached && mLp != null) {
+                refreshBarGeometry();
                 apply(mCurrentState);
             }
 
@@ -168,8 +246,29 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         }
     }
 
+    private void refreshBarGeometry() {
+        final int currentRotation = mContext.getDisplay().getRotation();
+        mLpChanged.gravity = getBarGravityForRotation(currentRotation);
+        rebuildPerRotationParams();
+    }
+
+    /**
+     * LayoutParams.copyFrom() intentionally aliases paramsForRotation. Build a fresh array before
+     * changing any nested rotation parameters so a future-rotation cutout update cannot be hidden by
+     * that aliasing and skipped by WindowManager.updateViewLayout().
+     */
+    private void rebuildPerRotationParams() {
+        WindowManager.LayoutParams[] params = new WindowManager.LayoutParams[4];
+        for (int rot = Surface.ROTATION_0; rot <= Surface.ROTATION_270; rot++) {
+            params[rot] = getBarLayoutParamsForRotation(rot);
+        }
+        mLpChanged.paramsForRotation = params;
+    }
+
     @Override
     public void attach() {
+        registerStatusBarInCutoutObserver();
+        refreshStatusBarInCutoutMode();
         if (StatusBarConnectedDisplays.isEnabled()) {
             mStatusBarWindowView.setStatusBarConfigurationController(
                     mStatusBarConfigurationController);
@@ -180,6 +279,8 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         Trace.beginSection("StatusBarWindowController.getBarLayoutParams");
         mLp = getBarLayoutParams(mContext.getDisplay().getRotation());
         Trace.endSection();
+        mLpChanged.copyFrom(mLp);
+        mStatusBarWindowView.setStatusBarGravity(mLp.gravity);
 
         try {
             mWindowManager.addView(mStatusBarWindowView, mLp);
@@ -197,9 +298,8 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
             mStatusBarConfigurationController.addCallback(mConfigurationListener);
             refreshStatusBarHeight();
         }
-        mLpChanged.copyFrom(mLp);
 
-        mContentInsetsProvider.addCallback(this::calculateStatusBarLocationsForAllRotations);
+        mContentInsetsProvider.addCallback(mStatusBarLocationsCallback);
         calculateStatusBarLocationsForAllRotations();
         mIsAttached = true;
         apply(mCurrentState);
@@ -208,6 +308,9 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
     @Override
     public void stop() {
         StatusBarConnectedDisplays.unsafeAssertInNewMode();
+        mIsAttached = false;
+        unregisterStatusBarInCutoutObserver();
+        mContentInsetsProvider.removeCallback(mStatusBarLocationsCallback);
 
         try {
             mWindowManager.removeView(mStatusBarWindowView);
@@ -281,17 +384,20 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
     }
 
     private WindowManager.LayoutParams getBarLayoutParamsForRotation(int rotation) {
-        int height = SystemBarUtils.getStatusBarHeightForRotation(mContext, rotation);
+        final int gravity = getBarGravityForRotation(rotation);
+        final DisplayCutout cutout = getDisplayCutoutForRotation(rotation);
+        final int thickness = getBarThicknessForRotation(gravity, cutout);
+        final boolean sideAligned = isSideGravity(gravity);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                height,
+                sideAligned ? thickness : WindowManager.LayoutParams.MATCH_PARENT,
+                sideAligned ? WindowManager.LayoutParams.MATCH_PARENT : thickness,
                 WindowManager.LayoutParams.TYPE_STATUS_BAR,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS,
                 PixelFormat.TRANSLUCENT);
         lp.privateFlags |= PRIVATE_FLAG_COLOR_SPACE_AGNOSTIC;
         lp.token = new Binder();
-        lp.gravity = Gravity.TOP;
+        lp.gravity = gravity;
         lp.setFitInsetsTypes(0 /* types */);
         String titleSuffix =
                 mDisplayId == Display.DEFAULT_DISPLAY ? "" : "(displayId=" + mDisplayId + ")";
@@ -300,21 +406,131 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         lp.layoutInDisplayCutoutMode = LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         final InsetsFrameProvider gestureInsetsProvider =
                 new InsetsFrameProvider(mInsetsSourceOwner, 0, mandatorySystemGestures());
-        final int safeTouchRegionHeight = mContext.getResources().getDimensionPixelSize(
+        final int safeTouchRegionSize = mContext.getResources().getDimensionPixelSize(
                 com.android.internal.R.dimen.display_cutout_touchable_region_size);
-        if (safeTouchRegionHeight > 0) {
+        if (safeTouchRegionSize > 0) {
             gestureInsetsProvider.setMinimalInsetsSizeInDisplayCutoutSafe(
-                    Insets.of(0, safeTouchRegionHeight, 0, 0));
+                    getInsets(safeTouchRegionSize, gravity));
         }
         lp.providedInsets = new InsetsFrameProvider[] {
                 new InsetsFrameProvider(mInsetsSourceOwner, 0, statusBars())
-                        .setInsetsSize(getInsets(height)),
+                        .setInsetsSize(getInsets(thickness, gravity)),
                 new InsetsFrameProvider(mInsetsSourceOwner, 0, tappableElement())
-                        .setInsetsSize(getInsets(height)),
+                        .setInsetsSize(getInsets(thickness, gravity)),
                 gestureInsetsProvider
         };
         return lp;
+    }
 
+    private DisplayCutout getDisplayCutoutForRotation(int rotation) {
+        final Display display = mContext.getDisplay();
+        final DisplayCutout cutout = display.getCutout();
+        if (cutout == null) {
+            return null;
+        }
+        final DisplayMetrics metrics = mContext.getResources().getDisplayMetrics();
+        return cutout.getRotated(
+                metrics.widthPixels, metrics.heightPixels, display.getRotation(), rotation);
+    }
+
+    private int getBarGravityForRotation(int rotation) {
+        if (!isCutoutAlignmentActive()) {
+            return Gravity.TOP;
+        }
+        final DisplayCutout cutout = getDisplayCutoutForRotation(rotation);
+        if (cutout == null || cutout.isEmpty()) {
+            return Gravity.TOP;
+        }
+
+        int populatedSides = 0;
+        int gravity = Gravity.TOP;
+        for (int side : new int[] {
+                Gravity.TOP, Gravity.LEFT, Gravity.RIGHT, Gravity.BOTTOM}) {
+            if (!getBoundsForGravity(cutout, side).isEmpty()) {
+                populatedSides++;
+                gravity = side;
+            }
+        }
+        if (populatedSides != 1 || isCornerCutout(cutout, rotation)) {
+            return Gravity.TOP;
+        }
+        return gravity;
+    }
+
+    private boolean isCornerCutout(DisplayCutout cutout, int rotation) {
+        final Display display = mContext.getDisplay();
+        final DisplayMetrics metrics = mContext.getResources().getDisplayMetrics();
+        final int rotationDelta = (rotation - display.getRotation() + 4) % 4;
+        final boolean swapDimensions = (rotationDelta % 2) != 0;
+        final int width = swapDimensions ? metrics.heightPixels : metrics.widthPixels;
+        final int height = swapDimensions ? metrics.widthPixels : metrics.heightPixels;
+        final Rect top = getBoundsForGravity(cutout, Gravity.TOP);
+        final Rect left = getBoundsForGravity(cutout, Gravity.LEFT);
+        final Rect right = getBoundsForGravity(cutout, Gravity.RIGHT);
+        final Rect bottom = getBoundsForGravity(cutout, Gravity.BOTTOM);
+        return (!top.isEmpty() && (top.left <= 0 || top.right >= width))
+                || (!left.isEmpty() && (left.top <= 0 || left.bottom >= height))
+                || (!right.isEmpty() && (right.top <= 0 || right.bottom >= height))
+                || (!bottom.isEmpty() && (bottom.left <= 0 || bottom.right >= width));
+    }
+
+    private int getBarThicknessForRotation(int gravity, DisplayCutout cutout) {
+        final int defaultSize = mContext.getResources().getDimensionPixelSize(
+                com.android.internal.R.dimen.status_bar_height_default);
+        if (cutout == null || cutout.isEmpty()) {
+            return defaultSize;
+        }
+        final Rect safeInsets = cutout.getSafeInsets();
+        final Insets waterfallInsets = cutout.getWaterfallInsets();
+        final int cutoutInset = getInsetForGravity(safeInsets, gravity);
+        final int waterfallInset = getInsetForGravity(waterfallInsets, gravity);
+        return Math.max(cutoutInset, defaultSize + waterfallInset);
+    }
+
+    private static Rect getBoundsForGravity(DisplayCutout cutout, int gravity) {
+        switch (gravity) {
+            case Gravity.LEFT:
+                return cutout.getBoundingRectLeft();
+            case Gravity.RIGHT:
+                return cutout.getBoundingRectRight();
+            case Gravity.BOTTOM:
+                return cutout.getBoundingRectBottom();
+            case Gravity.TOP:
+            default:
+                return cutout.getBoundingRectTop();
+        }
+    }
+
+    private static int getInsetForGravity(Rect insets, int gravity) {
+        switch (gravity) {
+            case Gravity.LEFT:
+                return insets.left;
+            case Gravity.RIGHT:
+                return insets.right;
+            case Gravity.BOTTOM:
+                return insets.bottom;
+            case Gravity.TOP:
+            default:
+                return insets.top;
+        }
+    }
+
+    private static int getInsetForGravity(Insets insets, int gravity) {
+        switch (gravity) {
+            case Gravity.LEFT:
+                return insets.left;
+            case Gravity.RIGHT:
+                return insets.right;
+            case Gravity.BOTTOM:
+                return insets.bottom;
+            case Gravity.TOP:
+            default:
+                return insets.top;
+        }
+    }
+
+    private static boolean isSideGravity(int gravity) {
+        return gravity == Gravity.LEFT || gravity == Gravity.RIGHT;
     }
 
     private void calculateStatusBarLocationsForAllRotations() {
@@ -390,38 +606,59 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
     }
 
     private void applyHeight(State state) {
-        mLpChanged.height =
-                state.mIsLaunchAnimationRunning ? ViewGroup.LayoutParams.MATCH_PARENT : mBarHeight;
+        final int currentRotation = mContext.getDisplay().getRotation();
+        rebuildPerRotationParams();
+        applyBarSize(mLpChanged, currentRotation, state);
         for (int rot = Surface.ROTATION_0; rot <= Surface.ROTATION_270; rot++) {
-            int height = SystemBarUtils.getStatusBarHeightForRotation(mContext, rot);
-            mLpChanged.paramsForRotation[rot].height =
-                    state.mIsLaunchAnimationRunning ? ViewGroup.LayoutParams.MATCH_PARENT : height;
-            // The status bar height could change at runtime if one display has a cutout while
+            final WindowManager.LayoutParams lp = mLpChanged.paramsForRotation[rot];
+            applyBarSize(lp, rot, state);
+            // The status bar size could change at runtime if one display has a cutout while
             // another doesn't (like some foldables). It could also change when using debug cutouts.
-            // So, we need to re-fetch the height and re-apply it to the insets each time to avoid
-            // bugs like b/290300359.
-            InsetsFrameProvider[] providers = mLpChanged.paramsForRotation[rot].providedInsets;
+            // Re-apply the actual content insets each time to avoid bugs like b/290300359.
+            final InsetsFrameProvider[] providers = lp.providedInsets;
             if (providers != null) {
+                final int thickness = getBarThicknessForRotation(
+                        lp.gravity, getDisplayCutoutForRotation(rot));
                 for (InsetsFrameProvider provider : providers) {
-                    provider.setInsetsSize(getInsets(height));
+                    provider.setInsetsSize(getInsets(thickness, lp.gravity));
                 }
             }
         }
     }
 
+    private void applyBarSize(
+            WindowManager.LayoutParams lp, int rotation, State state) {
+        if (state.mIsLaunchAnimationRunning) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            return;
+        }
+        final int thickness = getBarThicknessForRotation(
+                lp.gravity, getDisplayCutoutForRotation(rotation));
+        if (isSideGravity(lp.gravity)) {
+            lp.width = thickness;
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+        } else {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            lp.height = thickness;
+        }
+    }
+
     /**
-     * Get the insets that should be applied to the status bar window given the current status bar
-     * height.
+     * Get the insets occupied by the status-bar content in its current gravity.
      *
-     * The status bar window height can sometimes be full-screen (see {@link #applyHeight(State)}.
-     * However, the status bar *insets* should *not* be full-screen, because this would prevent apps
-     * from drawing any content and can cause animations to be cancelled (see b/283958440). Instead,
-     * the status bar insets should always be equal to the space occupied by the actual status bar
-     * content -- setting the insets correctly will prevent window manager from unnecessarily
-     * re-drawing this window and other windows. This method provides the correct insets.
+     * The status bar window can temporarily be full-screen during launch animations (see
+     * {@link #applyHeight(State)}). Its insets must still describe only the actual content,
+     * otherwise apps cannot draw and window-manager animations can be cancelled (b/283958440).
      */
-    private Insets getInsets(int height) {
-        return Insets.of(0, height, 0, 0);
+    private static Insets getInsets(int thickness, int gravity) {
+        return switch (gravity) {
+            case Gravity.LEFT -> Insets.of(thickness, 0, 0, 0);
+            case Gravity.RIGHT -> Insets.of(0, 0, thickness, 0);
+            case Gravity.BOTTOM -> Insets.of(0, 0, 0, thickness);
+            case Gravity.TOP -> Insets.of(0, thickness, 0, 0);
+            default -> Insets.NONE;
+        };
     }
 
     private void apply(State state) {
@@ -430,6 +667,8 @@ public class StatusBarWindowControllerImpl implements StatusBarWindowController 
         }
         applyForceStatusBarVisibleFlag(state);
         applyHeight(state);
+        mLpChanged.gravity = getBarGravityForRotation(mContext.getDisplay().getRotation());
+        mStatusBarWindowView.setStatusBarGravity(mLpChanged.gravity);
         if (mLp != null && mLp.copyFrom(mLpChanged) != 0) {
             mWindowManager.updateViewLayout(mStatusBarWindowView, mLp);
         }

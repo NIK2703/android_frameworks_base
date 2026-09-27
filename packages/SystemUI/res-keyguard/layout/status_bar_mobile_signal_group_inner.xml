@@ -72,6 +72,21 @@
             android:layout_width="2.5dp"
             android:visibility="gone"
             />
+        <!--
+          Roaming spacer required by MobileIconBinderKairos.bind(), which does
+          view.requireViewById<Space>(R.id.mobile_roaming_space). This res-keyguard layout is
+          used ONLY on the lock screen (shade_carrier_new -> status_bar_mobile_signal_group_new
+          -> this file), so the id must be present HERE as well as in the non-keyguard layouts,
+          otherwise requireViewById throws IllegalArgumentException and SystemUI crash-loops.
+          Kept alongside mobile_hd_space because MobileIconBinder (non-Kairos path) needs that
+          one: the union of both binders' ids must exist in this single layout.
+        -->
+        <Space
+            android:id="@+id/mobile_roaming_space"
+            android:layout_height="match_parent"
+            android:layout_width="@dimen/roaming_icon_start_padding"
+            android:visibility="gone"
+            />
         <FrameLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -93,6 +108,16 @@
                 android:src="@drawable/ic_hd_calling"
                 android:adjustViewBounds="true"
                 android:gravity="start|top"
+                android:visibility="gone" />
+            <!-- Required by MobileIconBinderKairos.bind() (R.id.mobile_roaming); see note above. -->
+            <ImageView
+                android:id="@+id/mobile_roaming"
+                android:layout_width="wrap_content"
+                android:layout_height="@dimen/status_bar_mobile_roam_size"
+                android:adjustViewBounds="true"
+                android:layout_gravity="top|start"
+                android:src="@drawable/stat_sys_roaming"
+                android:contentDescription="@string/data_connection_roaming"
                 android:visibility="gone" />
         </FrameLayout>
         <ImageView

@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlin.jvm.JvmOverloads
 
 /**
  * Moves the shade on the last display that received a status bar touch.
@@ -70,10 +71,15 @@ constructor(
     private var removalListener: Job? = null
 
     /** Called when the status bar or launcher homescreen on the given display is touched. */
-    fun onStatusBarOrLauncherTouched(event: MotionEvent, statusBarWidth: Int) {
+    @JvmOverloads
+    fun onStatusBarOrLauncherTouched(
+        event: MotionEvent,
+        statusBarLength: Int,
+        useLongAxisY: Boolean = false,
+    ) {
         ShadeWindowGoesAround.isUnexpectedlyInLegacyMode()
         updateShadeDisplayIfNeeded(event.displayId)
-        val element = classifyStatusBarEvent(event, statusBarWidth)
+        val element = classifyStatusBarEvent(event, statusBarLength, useLongAxisY)
         updateExpansionIntent(element)
     }
 
@@ -119,10 +125,12 @@ constructor(
 
     private fun classifyStatusBarEvent(
         motionEvent: MotionEvent,
-        statusbarWidth: Int,
+        statusBarLength: Int,
+        useLongAxisY: Boolean,
     ): ShadeElement {
-        val xPercentage = motionEvent.x / statusbarWidth
-        return if (xPercentage < 0.5f) notificationElement.get() else qsShadeElement.get()
+        val coordinate = if (useLongAxisY) motionEvent.y else motionEvent.x
+        val percentage = if (statusBarLength > 0) coordinate / statusBarLength else 0f
+        return if (percentage < 0.5f) notificationElement.get() else qsShadeElement.get()
     }
 
     private fun monitorDisplayRemovals(): Job {

@@ -30,6 +30,7 @@ import android.os.Trace
 import android.os.Trace.TRACE_TAG_APP
 import android.provider.AlarmClock
 import android.view.DisplayCutout
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -78,6 +79,7 @@ import com.android.systemui.statusbar.core.RudimentaryBattery
 import com.android.systemui.statusbar.data.repository.StatusBarContentInsetsProviderStore
 import com.android.systemui.statusbar.phone.StatusBarLocation
 import com.android.systemui.statusbar.phone.StatusIconContainer
+import com.android.systemui.util.leak.RotationUtils
 import com.android.systemui.statusbar.phone.StatusOverlayHoverListenerFactory
 import com.android.systemui.statusbar.phone.domain.interactor.IsAreaDark
 import com.android.systemui.statusbar.phone.ui.StatusBarIconController
@@ -572,6 +574,36 @@ constructor(
         val cutout = insets.displayCutout.also { this.cutout = it }
 
         val sbInsets: Insets = insetsProvider.getStatusBarContentInsetsForCurrentRotation()
+        val barGravity = insetsProvider.getStatusBarGravityForRotation(
+            RotationUtils.getExactRotation(context),
+        )
+        val isRelocatedBar = barGravity == Gravity.LEFT ||
+            barGravity == Gravity.RIGHT || barGravity == Gravity.BOTTOM
+        if (isRelocatedBar) {
+            // The shade remains a full-screen window. Keep its content clear of the relocated
+            // status-bar window instead of interpreting the side/bottom insets as a top notch.
+            val barArea = insetsProvider.getStatusBarContentAreaForCurrentRotation()
+            if (barArea != null) {
+                val left = if (barGravity == Gravity.LEFT) barArea.right else view.paddingLeft
+                val right = if (barGravity == Gravity.RIGHT) {
+                    view.width - barArea.left
+                } else {
+                    view.paddingRight
+                }
+                val bottom = if (barGravity == Gravity.BOTTOM) {
+                    view.height - barArea.top
+                } else {
+                    view.paddingBottom
+                }
+                view.setPadding(left, view.paddingTop, right, bottom)
+                updateQQSPaddings()
+                view.updateAllConstraints(
+                    combinedShadeHeadersConstraintManager.emptyCutoutConstraints(),
+                )
+                updateBatteryMode()
+                return
+            }
+        }
         val cutoutLeft = sbInsets.left
         val cutoutRight = sbInsets.right
         val hasCornerCutout: Boolean = insetsProvider.currentRotationHasCornerCutout()

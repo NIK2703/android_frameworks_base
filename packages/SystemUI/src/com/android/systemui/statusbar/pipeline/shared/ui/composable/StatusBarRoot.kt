@@ -724,12 +724,14 @@ private fun bindRegionSamplingViewModel(
  */
 @Composable
 private fun rememberViewWidthAsState(view: View): MutableIntState {
-    val viewWidth = remember(view) { mutableIntStateOf(view.boundsOnScreen.width()) }
+    // Use the view's local measured width. boundsOnScreen().width() is the narrow
+    // screen-space axis after the parent status-bar layout is rotated for a side bar.
+    val viewWidth = remember(view) { mutableIntStateOf(view.width) }
 
     DisposableEffect(view) {
         val layoutListener =
-            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-                viewWidth.intValue = view.boundsOnScreen.width()
+            View.OnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                viewWidth.intValue = v.width
             }
         view.addOnLayoutChangeListener(layoutListener)
 

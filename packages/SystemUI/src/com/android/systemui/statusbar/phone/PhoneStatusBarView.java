@@ -27,15 +27,18 @@ import android.inputmethodservice.InputMethodService;
 import android.os.RemoteException;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.ContextThemeWrapper;
 import android.view.Display;
 import android.view.DisplayCutout;
+import android.view.Gravity;
 import android.view.IWindowManager;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.WindowInsets;
 import android.view.WindowManagerGlobal;
 import android.view.accessibility.AccessibilityEvent;
@@ -59,6 +62,7 @@ import com.android.systemui.statusbar.core.StatusBarConnectedDisplays;
 import com.android.systemui.statusbar.phone.userswitcher.StatusBarUserSwitcherContainer;
 import com.android.systemui.statusbar.policy.Offset;
 import com.android.systemui.statusbar.window.StatusBarWindowControllerStore;
+import com.android.systemui.statusbar.window.StatusBarWindowView;
 import com.android.systemui.user.ui.binder.StatusBarUserChipViewBinder;
 import com.android.systemui.user.ui.viewmodel.StatusBarUserChipViewModel;
 import com.android.systemui.util.leak.RotationUtils;
@@ -102,6 +106,18 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
 
     @Nullable
     private ViewGroup mStatusBarContents = null;
+    @Nullable
+    private View mCenteredArea;
+    @Nullable
+    private View mBatteryBar;
+    @Nullable
+    private View mNotificationLightsOut;
+
+    private boolean mStatusBarInCutoutEnabled;
+    private boolean mStatusBarEdgeAligned;
+    private int mCutoutGravity = Gravity.TOP;
+    private int mCutoutSpaceSize;
+    private int mNotificationLightSize;
 
     /**
      * Draw this many pixels into the left/right side of the cutout to optimally use the space
@@ -200,8 +216,16 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         if (mStatusBarContents == null) {
             return;
         }
-        mStatusBarContents.setTranslationX(offset.getX());
-        mStatusBarContents.setTranslationY(offset.getY());
+        if (mStatusBarContents.getRotation() == 90f) {
+            mStatusBarContents.setTranslationX(-offset.getY());
+            mStatusBarContents.setTranslationY(offset.getX());
+        } else if (mStatusBarContents.getRotation() == -90f) {
+            mStatusBarContents.setTranslationX(offset.getY());
+            mStatusBarContents.setTranslationY(-offset.getX());
+        } else {
+            mStatusBarContents.setTranslationX(offset.getX());
+            mStatusBarContents.setTranslationY(offset.getY());
+        }
         invalidate();
     }
 
@@ -210,13 +234,60 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         super.onFinishInflate();
         mCutoutSpace = findViewById(R.id.cutout_space_view);
         mStatusBarContents = (ViewGroup) findViewById(R.id.status_bar_contents);
+        mCenteredArea = findViewById(R.id.centered_area);
+        mBatteryBar = findViewById(R.id.battery_bar);
+        mNotificationLightsOut = findViewById(R.id.notification_lights_out);
+        if (mNotificationLightsOut != null) {
+            mNotificationLightSize = getResources().getDimensionPixelSize(
+                    R.dimen.status_bar_icon_size_sp);
+        }
 
         updateResources();
+    }
+
+    /** Sets whether this view should rotate its content to follow the display cutout. */
+    public void setStatusBarInCutoutEnabled(boolean enabled) {
+        if (mStatusBarInCutoutEnabled == enabled) {
+            return;
+        }
+        mStatusBarInCutoutEnabled = enabled;
+        if (isAttachedToWindow()) {
+            updateLayoutForCutout();
+        }
+    }
+
+    /** Returns whether a touch is on the physical display edge occupied by the status bar. */
+    public boolean isTouchOnStatusBarDisplayEdge(float x, float y) {
+        return switch (mCutoutGravity) {
+            case Gravity.LEFT -> x < 1f;
+            case Gravity.RIGHT -> x >= getWidth() - 1f;
+            case Gravity.BOTTOM -> y >= getHeight() - 1f;
+            default -> y < 1f;
+        };
+    }
+
+    /** Returns the physical edge currently occupied by the status bar window. */
+    public int getStatusBarGravity() {
+        return mCutoutGravity;
+    }
+
+    /** Returns the long-axis length used by the rotated status-bar layout. */
+    public int getStatusBarLongAxisSize() {
+        return isSideGravity(mCutoutGravity) ? getHeight() : getWidth();
+    }
+
+    /** Returns the event coordinate along the status bar's long axis. */
+    public float getStatusBarLongAxisCoordinate(MotionEvent event) {
+        return isSideGravity(mCutoutGravity) ? event.getY() : event.getX();
     }
 
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        final StatusBarWindowView statusBarWindowView = findStatusBarWindowView();
+        if (statusBarWindowView != null) {
+            setStatusBarInCutoutEnabled(statusBarWindowView.isStatusBarInCutoutEnabled());
+        }
         if (updateDisplayParameters()) {
             updateLayoutForCutout();
             updateWindowHeight();
@@ -225,6 +296,19 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         if (mRotationButtonController != null && !hasNavigationBar()) {
             mCommandQueue.addCallback(this);
         }
+    }
+
+    @Nullable
+    private StatusBarWindowView findStatusBarWindowView() {
+        ViewParent parent = getParent();
+        while (parent instanceof View) {
+            if (parent instanceof StatusBarWindowView) {
+                return (StatusBarWindowView) parent;
+            }
+            parent = parent.getParent();
+        }
+        final View root = getRootView();
+        return root instanceof StatusBarWindowView ? (StatusBarWindowView) root : null;
     }
 
     @Override
@@ -300,9 +384,11 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
             mRotationOrientation = newRotation;
         }
 
-        if (!Objects.equals(getRootWindowInsets().getDisplayCutout(), mDisplayCutout)) {
+        WindowInsets rootInsets = getRootWindowInsets();
+        DisplayCutout rootCutout = rootInsets == null ? null : rootInsets.getDisplayCutout();
+        if (!Objects.equals(rootCutout, mDisplayCutout)) {
             changed = true;
-            mDisplayCutout = getRootWindowInsets().getDisplayCutout();
+            mDisplayCutout = rootCutout;
         }
 
         Configuration newConfiguration = mContext.getResources().getConfiguration();
@@ -413,7 +499,9 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         mCutoutSideNudge = getResources().getDimensionPixelSize(
                 R.dimen.display_cutout_margin_consumption);
 
+        updateCutoutMode();
         updateStatusBarHeight();
+        updateLayoutMode();
     }
 
     /**
@@ -439,8 +527,22 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         final int waterfallTopInset =
                 mDisplayCutout == null ? 0 : mDisplayCutout.getWaterfallInsets().top;
         ViewGroup.LayoutParams layoutParams = getLayoutParams();
-        mStatusBarHeight = SystemBarUtils.getStatusBarHeight(mContext);
-        layoutParams.height = mStatusBarHeight - waterfallTopInset;
+        mStatusBarHeight = Math.max(
+                SystemBarUtils.getStatusBarHeight(mContext),
+                getCutoutInsetForGravity(mDisplayCutout, mCutoutGravity));
+        if (mStatusBarEdgeAligned && isSideGravity(mCutoutGravity)) {
+            layoutParams.width = mStatusBarHeight;
+            layoutParams.height = ViewGroup.LayoutParams.MATCH_PARENT;
+        } else {
+            layoutParams.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            if (mStatusBarEdgeAligned || mStatusBarInCutoutEnabled) {
+                // The controller's per-rotation thickness already includes the waterfall inset
+                // when cutout alignment is enabled. Do not subtract it a second time.
+                layoutParams.height = mStatusBarHeight;
+            } else {
+                layoutParams.height = mStatusBarHeight - waterfallTopInset;
+            }
+        }
         updateSystemIconsContainerHeight();
         updatePaddings();
         setLayoutParams(layoutParams);
@@ -458,17 +560,27 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
     }
 
     private void updatePaddings() {
+        if (mStatusBarContents == null) {
+            return;
+        }
         int statusBarPaddingStart = getResources().getDimensionPixelSize(
                 R.dimen.status_bar_padding_start);
+        final int edgePadding = mStatusBarEdgeAligned
+                ? getResources().getDimensionPixelSize(R.dimen.rounded_corner_content_padding)
+                : 0;
 
         mStatusBarContents.setPaddingRelative(
-                statusBarPaddingStart + mStatusBarPaddingStart,
-                getResources().getDimensionPixelSize(R.dimen.status_bar_padding_top) + mStatusBarPaddingTop,
-                getResources().getDimensionPixelSize(R.dimen.status_bar_padding_end) + mStatusBarPaddingEnd,
+                statusBarPaddingStart + edgePadding + mStatusBarPaddingStart,
+                getResources().getDimensionPixelSize(R.dimen.status_bar_padding_top)
+                        + mStatusBarPaddingTop,
+                getResources().getDimensionPixelSize(R.dimen.status_bar_padding_end)
+                        + edgePadding + mStatusBarPaddingEnd,
                 0);
 
-        findViewById(R.id.notification_lights_out)
-                .setPaddingRelative(0, statusBarPaddingStart + mStatusBarPaddingStart, 0, 0);
+        if (mNotificationLightsOut != null) {
+            mNotificationLightsOut.setPaddingRelative(
+                    0, statusBarPaddingStart + mStatusBarPaddingStart, 0, 0);
+        }
 
         findViewById(R.id.system_icons).setPaddingRelative(
                 getResources().getDimensionPixelSize(R.dimen.status_bar_icons_padding_start),
@@ -479,19 +591,70 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
     }
 
     private void updateLayoutForCutout() {
+        updateCutoutMode();
         updateStatusBarHeight();
         updateCutoutLocation();
         updateSafeInsets();
+        updateLayoutMode();
+    }
+
+    private void updateCutoutMode() {
+        if (!mStatusBarInCutoutEnabled) {
+            mCutoutGravity = Gravity.TOP;
+            mStatusBarEdgeAligned = false;
+            return;
+        }
+
+        mCutoutGravity = getCutoutGravity();
+        mStatusBarEdgeAligned = mCutoutGravity != Gravity.TOP;
+    }
+
+    private int getCutoutGravity() {
+        if (mDisplayCutout == null || mDisplayCutout.isEmpty()
+                || isCornerCutout(mDisplayCutout)) {
+            return Gravity.TOP;
+        }
+
+        int populatedSides = 0;
+        int gravity = Gravity.TOP;
+        for (int side : new int[] {
+                Gravity.TOP, Gravity.LEFT, Gravity.RIGHT, Gravity.BOTTOM}) {
+            if (!getBoundsForGravity(mDisplayCutout, side).isEmpty()) {
+                populatedSides++;
+                gravity = side;
+            }
+        }
+        return populatedSides == 1 ? gravity : Gravity.TOP;
+    }
+
+    private boolean isCornerCutout(DisplayCutout cutout) {
+        final int width = mDisplaySize != null
+                ? mDisplaySize.width()
+                : getResources().getDisplayMetrics().widthPixels;
+        final int height = mDisplaySize != null
+                ? mDisplaySize.height()
+                : getResources().getDisplayMetrics().heightPixels;
+        final Rect top = getBoundsForGravity(cutout, Gravity.TOP);
+        final Rect left = getBoundsForGravity(cutout, Gravity.LEFT);
+        final Rect right = getBoundsForGravity(cutout, Gravity.RIGHT);
+        final Rect bottom = getBoundsForGravity(cutout, Gravity.BOTTOM);
+        return (!top.isEmpty() && (top.left <= 0 || top.right >= width))
+                || (!left.isEmpty() && (left.top <= 0 || left.bottom >= height))
+                || (!right.isEmpty() && (right.top <= 0 || right.bottom >= height))
+                || (!bottom.isEmpty() && (bottom.left <= 0 || bottom.right >= width));
     }
 
     private void updateCutoutLocation() {
+        mCutoutSpaceSize = 0;
         // Not all layouts have a cutout (e.g., Car)
         if (mCutoutSpace == null) {
             return;
         }
 
         boolean hasCornerCutout;
-        if (mHasCornerCutoutFetcher != null) {
+        if (mStatusBarEdgeAligned) {
+            hasCornerCutout = isCornerCutout(mDisplayCutout);
+        } else if (mHasCornerCutoutFetcher != null) {
             hasCornerCutout = mHasCornerCutoutFetcher.fetchHasCornerCutout();
         } else {
             Log.e(TAG, "mHasCornerCutoutFetcher unexpectedly null");
@@ -505,16 +668,31 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
 
         mCutoutSpace.setVisibility(View.VISIBLE);
         LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) mCutoutSpace.getLayoutParams();
-
-        Rect bounds = mDisplayCutout.getBoundingRectTop();
-
-        bounds.left = bounds.left + mCutoutSideNudge;
-        bounds.right = bounds.right - mCutoutSideNudge;
-        lp.width = bounds.width();
-        lp.height = bounds.height();
+        Rect bounds = getBoundsForGravity(mDisplayCutout, mCutoutGravity);
+        if (isSideGravity(mCutoutGravity)) {
+            bounds.top = bounds.top + mCutoutSideNudge;
+            bounds.bottom = bounds.bottom - mCutoutSideNudge;
+            lp.width = bounds.height();
+            lp.height = bounds.width();
+        } else {
+            bounds.left = bounds.left + mCutoutSideNudge;
+            bounds.right = bounds.right - mCutoutSideNudge;
+            lp.width = bounds.width();
+            lp.height = bounds.height();
+        }
+        mCutoutSpaceSize = lp.width;
     }
 
     private void updateSafeInsets() {
+        if (mCenteredArea != null) {
+            LayoutParams centeredAreaParams = (LayoutParams) mCenteredArea.getLayoutParams();
+            centeredAreaParams.leftMargin = 0;
+            centeredAreaParams.rightMargin = 0;
+        }
+        if (mStatusBarEdgeAligned) {
+            setPadding(0, 0, 0, 0);
+            return;
+        }
         if (mInsetsFetcher == null) {
             Log.e(TAG, "mInsetsFetcher unexpectedly null");
             return;
@@ -530,12 +708,145 @@ public class PhoneStatusBarView extends FrameLayout implements Callbacks {
         // Apply negative paddings to centered area layout so that we'll actually be on the center.
         Display display = getDisplay();
         final int winRotation = display != null ? display.getRotation() : Surface.ROTATION_0;
-        LayoutParams centeredAreaParams =
-                (LayoutParams) findViewById(R.id.centered_area).getLayoutParams();
-        centeredAreaParams.leftMargin =
-                winRotation == Surface.ROTATION_0 ? -insets.left : 0;
-        centeredAreaParams.rightMargin =
-                winRotation == Surface.ROTATION_0 ? -insets.right : 0;
+        if (mCenteredArea != null) {
+            LayoutParams centeredAreaParams = (LayoutParams) mCenteredArea.getLayoutParams();
+            centeredAreaParams.leftMargin =
+                    winRotation == Surface.ROTATION_0 ? -insets.left : 0;
+            centeredAreaParams.rightMargin =
+                    winRotation == Surface.ROTATION_0 ? -insets.right : 0;
+        }
+    }
+
+    private void updateLayoutMode() {
+        if (mStatusBarContents == null) {
+            return;
+        }
+        final int longAxisSize = getLongAxisSize();
+        final float contentRotation = getContentRotation();
+
+        // Keep the existing horizontal status-bar layout intact and rotate that layout as a whole.
+        // This preserves all of the icon-container, chip, and clock measurement code while moving
+        // the bar to a narrow side window.
+        LayoutParams contentsParams = (LayoutParams) mStatusBarContents.getLayoutParams();
+        contentsParams.width = mStatusBarEdgeAligned
+                ? longAxisSize : ViewGroup.LayoutParams.MATCH_PARENT;
+        contentsParams.height = mStatusBarEdgeAligned
+                ? mStatusBarHeight : ViewGroup.LayoutParams.MATCH_PARENT;
+        contentsParams.gravity = Gravity.CENTER;
+        if (mStatusBarContents.getRotation() != contentRotation) {
+            mStatusBarContents.setTranslationX(0f);
+            mStatusBarContents.setTranslationY(0f);
+        }
+        float contentsWidth = contentsParams.width > 0 ? contentsParams.width : getWidth();
+        float contentsHeight = contentsParams.height > 0 ? contentsParams.height : getHeight();
+        mStatusBarContents.setPivotX(contentsWidth / 2f);
+        mStatusBarContents.setPivotY(contentsHeight / 2f);
+        mStatusBarContents.setRotation(contentRotation);
+        mStatusBarContents.setLayoutParams(contentsParams);
+
+        if (mCenteredArea != null) {
+            LayoutParams centeredParams = (LayoutParams) mCenteredArea.getLayoutParams();
+            centeredParams.width = contentsParams.width;
+            centeredParams.height = contentsParams.height;
+            // The centered clock is an overlay. Keep it centered in the bar's local (horizontal)
+            // coordinate system before rotating that coordinate system for a side bar.
+            centeredParams.gravity = Gravity.CENTER;
+            centeredParams.leftMargin = 0;
+            centeredParams.rightMargin = 0;
+            float centeredWidth = centeredParams.width > 0 ? centeredParams.width : getWidth();
+            float centeredHeight = centeredParams.height > 0 ? centeredParams.height : getHeight();
+            mCenteredArea.setPivotX(centeredWidth / 2f);
+            mCenteredArea.setPivotY(centeredHeight / 2f);
+            mCenteredArea.setRotation(contentRotation);
+            mCenteredArea.setLayoutParams(centeredParams);
+        }
+
+        if (mBatteryBar != null) {
+            LayoutParams batteryParams = (LayoutParams) mBatteryBar.getLayoutParams();
+            batteryParams.width = mStatusBarEdgeAligned
+                    ? longAxisSize : ViewGroup.LayoutParams.MATCH_PARENT;
+            batteryParams.gravity = mStatusBarEdgeAligned
+                    ? Gravity.CENTER : Gravity.TOP | Gravity.START;
+            final int batteryBarThickness = batteryParams.height > 0 ? batteryParams.height : 1;
+            float batteryWidth = batteryParams.width > 0 ? batteryParams.width : getWidth();
+            mBatteryBar.setPivotX(batteryWidth / 2f);
+            mBatteryBar.setPivotY(batteryBarThickness / 2f);
+            mBatteryBar.setRotation(contentRotation);
+            mBatteryBar.setLayoutParams(batteryParams);
+        }
+
+        if (mNotificationLightsOut != null) {
+            LayoutParams lightParams = (LayoutParams) mNotificationLightsOut.getLayoutParams();
+            if (mStatusBarEdgeAligned) {
+                lightParams.width = mNotificationLightSize;
+                lightParams.height = mNotificationLightSize;
+                lightParams.gravity = switch (mCutoutGravity) {
+                    case Gravity.LEFT -> Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+                    case Gravity.RIGHT -> Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                    case Gravity.BOTTOM -> Gravity.START | Gravity.CENTER_VERTICAL;
+                    default -> Gravity.TOP | Gravity.START;
+                };
+            } else {
+                lightParams.width = mNotificationLightSize;
+                lightParams.height = ViewGroup.LayoutParams.MATCH_PARENT;
+                lightParams.gravity = Gravity.TOP | Gravity.START;
+            }
+            mNotificationLightsOut.setLayoutParams(lightParams);
+        }
+        requestLayout();
+    }
+
+    private int getLongAxisSize() {
+        if (mDisplaySize != null && mDisplaySize.width() > 0 && mDisplaySize.height() > 0) {
+            // In a side window the long axis of the rotated content is the current logical display
+            // height, not its width. Using the wrong axis makes the horizontal status-bar layout
+            // twice as wide as the side window and clips it.
+            return isSideGravity(mCutoutGravity) ? mDisplaySize.height() : mDisplaySize.width();
+        }
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return isSideGravity(mCutoutGravity) ? metrics.heightPixels : metrics.widthPixels;
+    }
+
+    private float getContentRotation() {
+        if (!mStatusBarEdgeAligned) {
+            return 0f;
+        }
+        return switch (mCutoutGravity) {
+            case Gravity.LEFT -> 90f;
+            case Gravity.RIGHT -> -90f;
+            default -> 0f;
+        };
+    }
+
+    private static boolean isSideGravity(int gravity) {
+        return gravity == Gravity.LEFT || gravity == Gravity.RIGHT;
+    }
+
+    private static int getCutoutInsetForGravity(DisplayCutout cutout, int gravity) {
+        if (cutout == null) {
+            return 0;
+        }
+        return getInsetForGravity(cutout.getSafeInsets(), gravity);
+    }
+
+    private static int getInsetForGravity(Rect insets, int gravity) {
+        return switch (gravity) {
+            case Gravity.LEFT -> insets.left;
+            case Gravity.RIGHT -> insets.right;
+            case Gravity.BOTTOM -> insets.bottom;
+            case Gravity.TOP -> insets.top;
+            default -> 0;
+        };
+    }
+
+    private static Rect getBoundsForGravity(DisplayCutout cutout, int gravity) {
+        return switch (gravity) {
+            case Gravity.LEFT -> cutout.getBoundingRectLeft();
+            case Gravity.RIGHT -> cutout.getBoundingRectRight();
+            case Gravity.BOTTOM -> cutout.getBoundingRectBottom();
+            case Gravity.TOP -> cutout.getBoundingRectTop();
+            default -> new Rect();
+        };
     }
 
     private void updateWindowHeight() {

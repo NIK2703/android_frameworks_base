@@ -22,10 +22,13 @@ import android.content.res.Resources
 import android.graphics.Insets
 import android.graphics.Point
 import android.graphics.Rect
+import android.os.UserHandle
 import android.util.LruCache
+import android.util.Log
 import android.util.Pair
 import android.view.Display.DEFAULT_DISPLAY
 import android.view.DisplayCutout
+import android.view.Gravity
 import android.view.Surface
 import androidx.annotation.VisibleForTesting
 import com.android.app.tracing.traceSection
@@ -39,6 +42,7 @@ import com.android.systemui.dump.DumpManager
 import com.android.systemui.res.R
 import com.android.systemui.statusbar.commandline.CommandRegistry
 import com.android.systemui.statusbar.core.StatusBarConnectedDisplays
+import com.android.systemui.statusbar.core.StatusBarForDesktop
 import com.android.systemui.statusbar.policy.CallbackController
 import com.android.systemui.statusbar.policy.ConfigurationController
 import com.android.systemui.util.leak.RotationUtils.ROTATION_LANDSCAPE
@@ -51,6 +55,7 @@ import com.android.systemui.util.leak.RotationUtils.getResourcesForRotation
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
 import dagger.assisted.AssistedInject
+import lineageos.providers.LineageSettings
 import java.io.PrintWriter
 import java.lang.Math.max
 import java.util.concurrent.CopyOnWriteArraySet
@@ -76,6 +81,13 @@ interface StatusBarContentInsetsProvider :
      * resources.
      */
     fun start()
+
+    /** Recompute cached geometry after an external setting or display-state change. */
+    fun refresh() {
+    }
+
+    /** Returns the physical status-bar edge for the requested rotation. */
+    fun getStatusBarGravityForRotation(@Rotation rotation: Int): Int = Gravity.TOP
 
     /**
      * Called when the [StatusBarContentInsetsProvider] should stop and do any required clean up.
@@ -200,6 +212,10 @@ constructor(
         }
     }
 
+    override fun refresh() {
+        clearCachedInsets()
+    }
+
     override fun stop() {
         StatusBarConnectedDisplays.unsafeAssertInNewMode()
         configurationController.removeCallback(this)
@@ -227,6 +243,14 @@ constructor(
         notifyInsetsChanged()
     }
 
+    override fun onOrientationChanged(orientation: Int) {
+        clearCachedInsets()
+    }
+
+    override fun onConfigChanged(newConfig: android.content.res.Configuration) {
+        clearCachedInsets()
+    }
+
     private fun clearCachedInsets() {
         insetsCache.evictAll()
         notifyInsetsChanged()
@@ -236,13 +260,103 @@ constructor(
         listeners.forEach { it.onStatusBarContentInsetsChanged() }
     }
 
+    private fun isStatusBarInCutoutEnabled(): Boolean {
+        if (context.displayId != DEFAULT_DISPLAY || StatusBarForDesktop.isEnabled) return false
+        return try {
+            LineageSettings.System.getIntForUser(
+                context.contentResolver,
+                LineageSettings.System.STATUS_BAR_IN_CUTOUT,
+                0,
+                UserHandle.USER_CURRENT,
+            ) != 0
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Unable to read cutout-aligned status-bar setting", e)
+            false
+        }
+    }
+
+    private fun rotatedCutoutForRotation(
+        cutout: DisplayCutout?,
+        rotation: Int,
+    ): DisplayCutout? {
+        if (cutout == null) return null
+        val metrics = context.resources.displayMetrics
+        return cutout.getRotated(
+            metrics.widthPixels,
+            metrics.heightPixels,
+            getExactRotation(context),
+            rotation,
+        )
+    }
+
+    private fun displaySizeForRotation(rotation: Int, currentBounds: Rect): Point {
+        val currentWidth = currentBounds.width()
+        val currentHeight = currentBounds.height()
+        val currentRotation = getExactRotation(context)
+        val relativeRotation = (rotation - currentRotation + 4) % 4
+        return if (relativeRotation == ROTATION_LANDSCAPE ||
+            relativeRotation == ROTATION_SEASCAPE
+        ) {
+            Point(currentHeight, currentWidth)
+        } else {
+            Point(currentWidth, currentHeight)
+        }
+    }
+
+    private fun isCornerCutout(cutout: DisplayCutout, size: Point): Boolean {
+        val top = cutout.boundingRectTop
+        val left = cutout.boundingRectLeft
+        val right = cutout.boundingRectRight
+        val bottom = cutout.boundingRectBottom
+        return (!top.isEmpty && (top.left <= 0 || top.right >= size.x)) ||
+            (!left.isEmpty && (left.top <= 0 || left.bottom >= size.y)) ||
+            (!right.isEmpty && (right.top <= 0 || right.bottom >= size.y)) ||
+            (!bottom.isEmpty && (bottom.left <= 0 || bottom.right >= size.x))
+    }
+
+    private fun statusBarGravityForRotation(
+        rotation: Int,
+        displayCutout: DisplayCutout?,
+    ): Int {
+        if (!isStatusBarInCutoutEnabled()) return Gravity.TOP
+        val cutout = rotatedCutoutForRotation(displayCutout, rotation) ?: return Gravity.TOP
+        if (cutout.isEmpty) return Gravity.TOP
+        val currentBounds = context.resources.configuration.windowConfiguration.maxBounds
+        val size = displaySizeForRotation(rotation, currentBounds)
+        if (isCornerCutout(cutout, size)) return Gravity.TOP
+        var populatedSides = 0
+        var gravity = Gravity.TOP
+        if (!cutout.boundingRectTop.isEmpty) {
+            populatedSides++
+            gravity = Gravity.TOP
+        }
+        if (!cutout.boundingRectLeft.isEmpty) {
+            populatedSides++
+            gravity = Gravity.LEFT
+        }
+        if (!cutout.boundingRectRight.isEmpty) {
+            populatedSides++
+            gravity = Gravity.RIGHT
+        }
+        if (!cutout.boundingRectBottom.isEmpty) {
+            populatedSides++
+            gravity = Gravity.BOTTOM
+        }
+        return if (populatedSides == 1) gravity else Gravity.TOP
+    }
+
+    override fun getStatusBarGravityForRotation(@Rotation rotation: Int): Int {
+        return statusBarGravityForRotation(rotation, context.display?.cutout)
+    }
+
     override fun currentRotationHasCornerCutout(): Boolean {
-        val cutout = checkNotNull(context.display).cutout ?: return false
-        val topBounds = cutout.boundingRectTop
-
+        val rotation = getExactRotation(context)
+        val cutout = context.display?.cutout
+        if (statusBarGravityForRotation(rotation, cutout) != Gravity.TOP) return false
+        val topBounds = cutout?.boundingRectTop ?: return false
+        if (topBounds.isEmpty) return false
         val point = Point()
-        checkNotNull(context.display).getRealSize(point)
-
+        context.display?.getRealSize(point)
         return topBounds.left <= 0 || topBounds.right >= point.x
     }
 
@@ -271,14 +385,8 @@ constructor(
             val sysUICutout = sysUICutoutProvider.cutoutInfoForCurrentDisplayAndRotation()
             val displayCutout = sysUICutout?.cutout
             val key = getCacheKey(rotation, displayCutout)
-
-            val screenBounds = context.resources.configuration.windowConfiguration.maxBounds
-            val point = Point(screenBounds.width(), screenBounds.height())
-
-            // Target rotation can be a different orientation than the current device rotation
-            point.orientToRotZero(getExactRotation(context))
-            val width = point.logicalWidth(rotation)
-
+            val currentBounds = context.resources.configuration.windowConfiguration.maxBounds
+            val displaySize = displaySizeForRotation(rotation, currentBounds)
             val area =
                 insetsCache[key]
                     ?: getAndSetCalculatedAreaForRotation(
@@ -288,7 +396,17 @@ constructor(
                         key,
                     )
 
-            Insets.of(area.left, area.top, /* right= */ width - area.right, /* bottom= */ 0)
+            val bottomInset = if (statusBarGravityForRotation(rotation, displayCutout) == Gravity.BOTTOM) {
+                displaySize.y - area.bottom
+            } else {
+                0
+            }
+            Insets.of(
+                area.left,
+                area.top,
+                displaySize.x - area.right,
+                bottomInset,
+            )
         }
 
     override fun getStatusBarContentInsetsForCurrentRotation(): Insets {
@@ -324,11 +442,59 @@ constructor(
         }
     }
 
+    private fun getStatusBarThicknessForRotation(
+        @Rotation targetRotation: Int,
+        displayCutout: DisplayCutout?,
+        resources: Resources,
+    ): Int {
+        val defaultSize = resources.getDimensionPixelSize(
+            com.android.internal.R.dimen.status_bar_height_default,
+        )
+        val cutout = rotatedCutoutForRotation(displayCutout, targetRotation)
+        if (!isStatusBarInCutoutEnabled() || cutout == null || cutout.isEmpty) {
+            return max(defaultSize, SystemBarUtils.getStatusBarHeightForRotation(context, targetRotation))
+        }
+        val gravity = statusBarGravityForRotation(targetRotation, displayCutout)
+        val safeInsets = cutout.safeInsets
+        val waterfallInsets = cutout.waterfallInsets
+        val cutoutInset = when (gravity) {
+            Gravity.LEFT -> safeInsets.left
+            Gravity.RIGHT -> safeInsets.right
+            Gravity.BOTTOM -> safeInsets.bottom
+            else -> safeInsets.top
+        }
+        val waterfallInset = when (gravity) {
+            Gravity.LEFT -> waterfallInsets.left
+            Gravity.RIGHT -> waterfallInsets.right
+            Gravity.BOTTOM -> waterfallInsets.bottom
+            else -> waterfallInsets.top
+        }
+        return max(cutoutInset, defaultSize + waterfallInset)
+    }
+
     private fun getCalculatedAreaForRotation(
         sysUICutout: SysUICutoutInformation?,
         @Rotation targetRotation: Int,
         rotatedResources: Resources,
     ): Rect {
+        val displayCutout = sysUICutout?.cutout
+        val edge = statusBarGravityForRotation(targetRotation, displayCutout)
+        val currentBounds = context.resources.configuration.windowConfiguration.maxBounds
+        val displaySize = displaySizeForRotation(targetRotation, currentBounds)
+        if (edge != Gravity.TOP) {
+            val thickness = getStatusBarThicknessForRotation(
+                targetRotation,
+                displayCutout,
+                rotatedResources,
+            )
+            return when (edge) {
+                Gravity.LEFT -> Rect(0, 0, thickness, displaySize.y)
+                Gravity.RIGHT -> Rect(displaySize.x - thickness, 0, displaySize.x, displaySize.y)
+                Gravity.BOTTOM -> Rect(0, displaySize.y - thickness, displaySize.x, displaySize.y)
+                else -> Rect(0, 0, displaySize.x, thickness)
+            }
+        }
+
         val currentRotation = getExactRotation(context)
 
         val roundedCornerPadding =
@@ -430,7 +596,11 @@ constructor(
     }
 
     override fun getStatusBarPaddingTop(@Rotation rotation: Int?): Int {
-        val res = rotation?.let { it -> getResourcesForRotation(it, context) } ?: context.resources
+        val targetRotation = rotation ?: getExactRotation(context)
+        if (statusBarGravityForRotation(targetRotation, context.display?.cutout) != Gravity.TOP) {
+            return 0
+        }
+        val res = getResourcesForRotation(targetRotation, context)
         return res.getDimensionPixelSize(R.dimen.status_bar_padding_top)
     }
 
@@ -445,12 +615,14 @@ constructor(
             rotation = rotation,
             displaySize = Rect(context.resources.configuration.windowConfiguration.maxBounds),
             displayCutout = displayCutout,
+            statusBarInCutoutEnabled = isStatusBarInCutoutEnabled(),
         )
 
     private data class CacheKey(
         @Rotation val rotation: Int,
         val displaySize: Rect,
         val displayCutout: DisplayCutout?,
+        val statusBarInCutoutEnabled: Boolean,
     )
 }
 
@@ -589,8 +761,9 @@ private fun getStatusBarContentBounds(
 
     val logicalDisplayWidth = if (targetRotation.isHorizontal()) height else width
 
-    // Exclude the bottom rect, as it doesn't intersect with the status bar.
-    val cutoutRects = sysUICutout?.cutout?.boundingRectsLeftRightTop
+    // Include all cutout edges; shareShortEdge() below filters out edges that do not intersect the
+    // current status-bar window.
+    val cutoutRects = sysUICutout?.cutout?.boundingRectsAll
     if (cutoutRects.isNullOrEmpty()) {
         return Rect(minLeft, insetTop, logicalDisplayWidth - minRight, sbHeight)
     }
@@ -643,8 +816,13 @@ private fun rectUnion(first: Rect, second: Rect) = Rect(first).apply { union(sec
 private fun Rect.intersects(other: Rect): Boolean =
     intersects(other.left, other.top, other.right, other.bottom)
 
-private val DisplayCutout.boundingRectsLeftRightTop
-    get() = listOf(boundingRectLeft, boundingRectRight, boundingRectTop).filter { !it.isEmpty }
+private val DisplayCutout.boundingRectsAll
+    get() = listOf(
+        boundingRectLeft,
+        boundingRectRight,
+        boundingRectTop,
+        boundingRectBottom,
+    ).filter { !it.isEmpty }
 
 /*
  * Returns the inset top of the status bar.

@@ -20,6 +20,7 @@ import android.provider.Settings
 import android.util.Log
 import android.view.Display.DEFAULT_DISPLAY
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
@@ -165,7 +166,12 @@ private constructor(
             // Notify the shade display policy that the status bar was touched. This may cause
             // the shade to change display if the touch was in a display different than the shade
             // one.
-            lazyStatusBarShadeDisplayPolicy.get().onStatusBarOrLauncherTouched(event, mView.width)
+            lazyStatusBarShadeDisplayPolicy.get().onStatusBarOrLauncherTouched(
+                event,
+                mView.getStatusBarLongAxisSize(),
+                mView.getStatusBarGravity() == Gravity.LEFT ||
+                    mView.getStatusBarGravity() == Gravity.RIGHT,
+            )
         }
     }
 
@@ -379,8 +385,15 @@ private constructor(
                     initialTouchY = event.y
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    val dx = event.x - initialTouchX
                     val dy = event.y - initialTouchY
-                    if (dy > touchSlop) {
+                    val pulledTowardShade = when (mView.getStatusBarGravity()) {
+                        Gravity.LEFT -> dx > touchSlop
+                        Gravity.RIGHT -> dx < -touchSlop
+                        Gravity.BOTTOM -> dy < -touchSlop
+                        else -> dy > touchSlop
+                    }
+                    if (pulledTowardShade) {
                         if (!isIntercepting) {
                             isIntercepting = true
                             dispatchCachedEvents()
@@ -437,9 +450,10 @@ private constructor(
                     )
                     return true
                 }
-                if (panelExpansionInteractor.isFullyCollapsed && event.y < 1f) {
-                    // b/235889526 Eat events on the top edge of the phone when collapsed
-                    shadeLogger.logMotionEvent(event, "top edge touch ignored")
+                if (panelExpansionInteractor.isFullyCollapsed &&
+                        mView.isTouchOnStatusBarDisplayEdge(event.x, event.y)) {
+                    // b/235889526 Eat events on the status bar's display edge when collapsed.
+                    shadeLogger.logMotionEvent(event, "status bar display edge touch ignored")
                     return true
                 }
             }

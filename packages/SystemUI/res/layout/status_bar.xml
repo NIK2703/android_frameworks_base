@@ -25,6 +25,7 @@
     android:layout_height="@dimen/status_bar_height"
     android:id="@+id/status_bar"
     android:orientation="vertical"
+    android:clipChildren="false"
     android:focusable="false"
     android:descendantFocusability="afterDescendants"
     android:accessibilityPaneTitle="@string/status_bar"

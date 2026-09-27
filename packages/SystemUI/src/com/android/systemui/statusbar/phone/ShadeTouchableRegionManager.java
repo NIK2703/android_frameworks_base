@@ -21,7 +21,9 @@ import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.Rect;
 import android.graphics.Region;
+import android.os.UserHandle;
 import android.util.Log;
+import android.view.Display;
 import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.View;
@@ -56,6 +58,8 @@ import com.android.systemui.statusbar.notification.headsup.OnHeadsUpChangedListe
 import com.android.systemui.statusbar.policy.ConfigurationController;
 import com.android.systemui.statusbar.policy.ConfigurationController.ConfigurationListener;
 import com.android.systemui.util.kotlin.JavaAdapter;
+
+import lineageos.providers.LineageSettings;
 
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -294,10 +298,9 @@ public final class ShadeTouchableRegionManager implements Dumpable {
         if (headsUpTouchableRegion != null) {
             mTouchableRegion.set(headsUpTouchableRegion);
         } else {
-            // If there aren't any HUNs, update the touch region to the status bar
-            // width/height, potentially adjusting for a display cutout (notch)
-            mTouchableRegion.set(0, 0, mNotificationShadeWindowView.getWidth(),
-                    mStatusBarHeight);
+            // If there aren't any HUNs, update the touch region to the current physical status-bar
+            // edge. A side or bottom bar must not leave the old top strip touchable.
+            mTouchableRegion.set(getStatusBarBounds());
             updateRegionForNotch(mTouchableRegion);
         }
         return mTouchableRegion;
@@ -320,12 +323,29 @@ public final class ShadeTouchableRegionManager implements Dumpable {
         if (mShadeBounds != null && mIsSceneGone) {
             touchableRects.add(mShadeBounds);
         } else {
-            touchableRects.add(
-                    new Rect(
-                            /* left= */ 0,
-                            /* top= */ mStatusBarHeight,
-                            /* right= */ mNotificationShadeWindowView.getWidth(),
-                            /* bottom= */ mNotificationShadeWindowView.getHeight()));
+            Rect shadeBounds = new Rect(0, 0,
+                    mNotificationShadeWindowView.getWidth(),
+                    mNotificationShadeWindowView.getHeight());
+            Rect statusBarBounds = getStatusBarBounds();
+            switch (getStatusBarGravity()) {
+                case Gravity.TOP:
+                    shadeBounds.top = statusBarBounds.bottom;
+                    break;
+                case Gravity.BOTTOM:
+                    shadeBounds.bottom = statusBarBounds.top;
+                    break;
+                case Gravity.LEFT:
+                    shadeBounds.left = statusBarBounds.right;
+                    break;
+                case Gravity.RIGHT:
+                    shadeBounds.right = statusBarBounds.left;
+                    break;
+                default:
+                    break;
+            }
+            if (!shadeBounds.isEmpty()) {
+                touchableRects.add(shadeBounds);
+            }
         }
 
         final Region headsUpTouchableRegion = mHeadsUpManager.getTouchableRegion();
@@ -340,7 +360,7 @@ public final class ShadeTouchableRegionManager implements Dumpable {
         Resources resources = mContext.getResources();
         mDisplayCutoutTouchableRegionSize = resources.getDimensionPixelSize(
                 com.android.internal.R.dimen.display_cutout_touchable_region_size);
-        mStatusBarHeight = SystemBarUtils.getStatusBarHeight(mContext);
+        mStatusBarHeight = getStatusBarThickness();
     }
 
     /**
@@ -421,18 +441,147 @@ public final class ShadeTouchableRegionManager implements Dumpable {
             return;
         }
 
-        // Expand touchable region such that we also catch touches that just start below the notch
-        // area.
+        // Expand touchable region inward from the physical cutout edge so touches that begin just
+        // inside the cutout are handled by SystemUI.
         Rect bounds = new Rect();
-        ScreenDecorations.DisplayCutoutView.boundsFromDirection(cutout, Gravity.TOP, bounds);
-        bounds.offset(0, mDisplayCutoutTouchableRegionSize);
+        int gravity = getStatusBarGravity();
+        ScreenDecorations.DisplayCutoutView.boundsFromDirection(cutout, gravity, bounds);
+        switch (gravity) {
+            case Gravity.LEFT -> bounds.offset(mDisplayCutoutTouchableRegionSize, 0);
+            case Gravity.RIGHT -> bounds.offset(-mDisplayCutoutTouchableRegionSize, 0);
+            case Gravity.BOTTOM -> bounds.offset(0, -mDisplayCutoutTouchableRegionSize);
+            case Gravity.TOP -> bounds.offset(0, mDisplayCutoutTouchableRegionSize);
+            default -> { }
+        }
         touchableRegion.union(bounds);
     }
 
-    /**
-     * Helper to let us know when calculating the region is not needed because we know the entire
-     * screen needs to be touchable.
-     */
+    private boolean isStatusBarInCutoutEnabled() {
+        try {
+            return LineageSettings.System.getIntForUser(
+                    mContext.getContentResolver(),
+                    LineageSettings.System.STATUS_BAR_IN_CUTOUT,
+                    0,
+                    UserHandle.USER_CURRENT) != 0;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Unable to read cutout-aligned status-bar setting", e);
+            return false;
+        }
+    }
+
+    private DisplayCutout getDisplayCutout() {
+        Display display = mContext.getDisplay();
+        return display == null ? null : display.getCutout();
+    }
+
+    private int getStatusBarGravity() {
+        if (!isStatusBarInCutoutEnabled()) {
+            return Gravity.TOP;
+        }
+        DisplayCutout cutout = getDisplayCutout();
+        if (cutout == null || cutout.isEmpty()) {
+            return Gravity.TOP;
+        }
+        Rect top = cutout.getBoundingRectTop();
+        Rect left = cutout.getBoundingRectLeft();
+        Rect right = cutout.getBoundingRectRight();
+        Rect bottom = cutout.getBoundingRectBottom();
+        int populatedSides = 0;
+        int gravity = Gravity.TOP;
+        if (!top.isEmpty()) {
+            populatedSides++;
+            gravity = Gravity.TOP;
+        }
+        if (!left.isEmpty()) {
+            populatedSides++;
+            gravity = Gravity.LEFT;
+        }
+        if (!right.isEmpty()) {
+            populatedSides++;
+            gravity = Gravity.RIGHT;
+        }
+        if (!bottom.isEmpty()) {
+            populatedSides++;
+            gravity = Gravity.BOTTOM;
+        }
+        if (populatedSides != 1 || isCornerCutout(cutout)) {
+            return Gravity.TOP;
+        }
+        return gravity;
+    }
+
+    private boolean isCornerCutout(DisplayCutout cutout) {
+        int width = mContext.getResources().getDisplayMetrics().widthPixels;
+        int height = mContext.getResources().getDisplayMetrics().heightPixels;
+        Rect top = cutout.getBoundingRectTop();
+        Rect left = cutout.getBoundingRectLeft();
+        Rect right = cutout.getBoundingRectRight();
+        Rect bottom = cutout.getBoundingRectBottom();
+        return (!top.isEmpty() && (top.left <= 0 || top.right >= width))
+                || (!left.isEmpty() && (left.top <= 0 || left.bottom >= height))
+                || (!right.isEmpty() && (right.top <= 0 || right.bottom >= height))
+                || (!bottom.isEmpty() && (bottom.left <= 0 || bottom.right >= width));
+    }
+
+    private int getStatusBarThickness() {
+        int defaultSize = mContext.getResources().getDimensionPixelSize(
+                com.android.internal.R.dimen.status_bar_height_default);
+        DisplayCutout cutout = getDisplayCutout();
+        if (!isStatusBarInCutoutEnabled() || cutout == null || cutout.isEmpty()) {
+            return Math.max(defaultSize, SystemBarUtils.getStatusBarHeight(mContext));
+        }
+        int gravity = getStatusBarGravity();
+        int cutoutInset;
+        int waterfallInset;
+        switch (gravity) {
+            case Gravity.LEFT:
+                cutoutInset = cutout.getSafeInsets().left;
+                waterfallInset = cutout.getWaterfallInsets().left;
+                break;
+            case Gravity.RIGHT:
+                cutoutInset = cutout.getSafeInsets().right;
+                waterfallInset = cutout.getWaterfallInsets().right;
+                break;
+            case Gravity.BOTTOM:
+                cutoutInset = cutout.getSafeInsets().bottom;
+                waterfallInset = cutout.getWaterfallInsets().bottom;
+                break;
+            case Gravity.TOP:
+            default:
+                cutoutInset = cutout.getSafeInsets().top;
+                waterfallInset = cutout.getWaterfallInsets().top;
+                break;
+        }
+        return Math.max(cutoutInset, defaultSize + waterfallInset);
+    }
+
+    private Rect getStatusBarBounds() {
+        int width = mNotificationShadeWindowView == null
+                ? mContext.getResources().getDisplayMetrics().widthPixels
+                : mNotificationShadeWindowView.getWidth();
+        int height = mNotificationShadeWindowView == null
+                ? mContext.getResources().getDisplayMetrics().heightPixels
+                : mNotificationShadeWindowView.getHeight();
+        if (width <= 0 || height <= 0) {
+            width = mContext.getResources().getDisplayMetrics().widthPixels;
+            height = mContext.getResources().getDisplayMetrics().heightPixels;
+        }
+        int thickness = getStatusBarThickness();
+        int gravity = getStatusBarGravity();
+        switch (gravity) {
+            case Gravity.LEFT:
+                return new Rect(0, 0, thickness, height);
+            case Gravity.RIGHT:
+                return new Rect(width - thickness, 0, width, height);
+            case Gravity.BOTTOM:
+                return new Rect(0, height - thickness, width, height);
+            case Gravity.TOP:
+            default:
+                return new Rect(0, 0, width, thickness);
+        }
+    }
+
+
     @VisibleForTesting
     boolean shouldMakeEntireScreenTouchable() {
         if (mIsDesktopStatusBarEnabled) {

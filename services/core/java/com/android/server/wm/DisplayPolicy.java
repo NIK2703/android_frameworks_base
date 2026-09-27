@@ -1807,7 +1807,9 @@ public class DisplayPolicy {
         //  dim layer     window    dim layer
         mStatusBarAppearanceRegionList.add(new AppearanceRegion(appearance, new Rect(winFrame)));
         if (!sTmpRect.equals(sTmpRect2)) {
-            if (sTmpRect.height() == sTmpRect2.height()) {
+            // The status bar may be on any display edge. Split the appearance region along the
+            // long axis of the bar frame rather than assuming a horizontal top bar.
+            if (statusBarFrame.width() >= statusBarFrame.height()) {
                 if (sTmpRect.left != sTmpRect2.left) {
                     mStatusBarAppearanceRegionList.add(new AppearanceRegion(0, new Rect(
                             winBounds.left, winBounds.top, sTmpRect2.left, winBounds.bottom)));
@@ -1816,8 +1818,16 @@ public class DisplayPolicy {
                     mStatusBarAppearanceRegionList.add(new AppearanceRegion(0, new Rect(
                             sTmpRect2.right, winBounds.top, winBounds.right, winBounds.bottom)));
                 }
+            } else {
+                if (sTmpRect.top != sTmpRect2.top) {
+                    mStatusBarAppearanceRegionList.add(new AppearanceRegion(0, new Rect(
+                            winBounds.left, winBounds.top, winBounds.right, sTmpRect2.top)));
+                }
+                if (sTmpRect.bottom != sTmpRect2.bottom) {
+                    mStatusBarAppearanceRegionList.add(new AppearanceRegion(0, new Rect(
+                            winBounds.left, sTmpRect2.bottom, winBounds.right, winBounds.bottom)));
+                }
             }
-            // We don't have vertical status bar yet, so we don't handle the other orientation.
         }
         mStatusBarColorCheckedBounds.union(sTmpRect);
         return true;
